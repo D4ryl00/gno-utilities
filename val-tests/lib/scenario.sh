@@ -1,0 +1,796 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+set -euo pipefail
+
+SCENARIO_SELF="${(%):-%N}"
+SCENARIO_LIB_DIR="$(cd "$(dirname "${SCENARIO_SELF}")" && pwd)"
+REPO_ROOT="$(cd "${SCENARIO_LIB_DIR}/.." && pwd)"
+
+IMAGE_NAME="${IMAGE_NAME:-gno-scenario-all:local}"
+WORK_ROOT="${WORK_ROOT:-${REPO_ROOT}/.work}"
+CHAIN_ID="${CHAIN_ID:-dev}"
+TIMEOUT_COMMIT="${TIMEOUT_COMMIT:-1s}"
+LOG_LEVEL="${LOG_LEVEL:-info}"
+TX_KEY_NAME="${TX_KEY_NAME:-scenario-tx}"
+TX_PASSWORD="${TX_PASSWORD:-test123456}"
+TX_MNEMONIC="${TX_MNEMONIC:-source bonus chronic canvas draft south burst lottery vacant surface solve popular case indicate oppose farm nothing bullet exhibit title speed wink action roast}"
+TX_ADDRESS="${TX_ADDRESS:-g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5}"
+TX_BALANCE="${TX_BALANCE:-100000000000ugnot}"
+TX_GAS_FEE="${TX_GAS_FEE:-1000000ugnot}"
+TX_GAS_WANTED_ADD_PKG="${TX_GAS_WANTED_ADD_PKG:-7000000}"
+TX_GAS_WANTED_CALL="${TX_GAS_WANTED_CALL:-3000000}"
+TX_GAS_WANTED_RUN="${TX_GAS_WANTED_RUN:-5000000}"
+TX_GAS_WANTED_SEND="${TX_GAS_WANTED_SEND:-2000000}"
+
+typeset -ga SCENARIO_NODES=()
+typeset -ga SCENARIO_VALIDATORS=()
+typeset -ga SCENARIO_SENTRIES=()
+typeset -gA NODE_ROLE=()
+typeset -gA NODE_SERVICE=()
+typeset -gA NODE_MONIKER=()
+typeset -gA NODE_RPC_PORT=()
+typeset -gA NODE_PEX=()
+typeset -gA NODE_SENTRY=()
+typeset -gA NODE_ID=()
+typeset -gA NODE_DATA_DIR=()
+
+SCENARIO_NAME=""
+PROJECT_NAME=""
+SCENARIO_DIR=""
+COMPOSE_FILE=""
+KEY_HOME=""
+NETWORK_NAME=""
+
+log() {
+  printf '[%s] %s\n' "${SCENARIO_NAME:-scenario}" "$*"
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+join_by() {
+  local delimiter="${1:?delimiter required}"
+  shift || true
+  local out=""
+  local first=1
+  local value
+  for value in "$@"; do
+    if [ "$first" -eq 1 ]; then
+      out="$value"
+      first=0
+    else
+      out="${out}${delimiter}${value}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+slugify() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-'
+}
+
+require_tools() {
+  local missing=()
+  local tool
+  for tool in docker jq curl; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      missing+=("$tool")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    die "missing required tools: $(join_by ', ' "${missing[@]}")"
+  fi
+}
+
+scenario_init() {
+  local name="${1:?scenario name required}"
+
+  SCENARIO_NAME="$name"
+  PROJECT_NAME="$(slugify "$name")"
+  SCENARIO_DIR="${WORK_ROOT}/${PROJECT_NAME}"
+  COMPOSE_FILE="${SCENARIO_DIR}/docker-compose.yml"
+  KEY_HOME="${SCENARIO_DIR}/keys"
+  NETWORK_NAME="${PROJECT_NAME}_chain"
+
+  SCENARIO_NODES=()
+  SCENARIO_VALIDATORS=()
+  SCENARIO_SENTRIES=()
+  NODE_ROLE=()
+  NODE_SERVICE=()
+  NODE_MONIKER=()
+  NODE_RPC_PORT=()
+  NODE_PEX=()
+  NODE_SENTRY=()
+  NODE_ID=()
+  NODE_DATA_DIR=()
+}
+
+next_rpc_port() {
+  printf '%s' "$((26657 + (${#SCENARIO_NODES[@]} * 100)))"
+}
+
+register_node() {
+  local name="${1:?node name required}"
+  local role="${2:?role required}"
+  local rpc_port="${3:?rpc port required}"
+  local pex="${4:?pex required}"
+  local sentry="${5:-}"
+
+  [ -z "${NODE_ROLE[$name]:-}" ] || die "node ${name} already exists"
+
+  SCENARIO_NODES+=("$name")
+  NODE_ROLE[$name]="$role"
+  NODE_SERVICE[$name]="$name"
+  NODE_MONIKER[$name]="$name"
+  NODE_RPC_PORT[$name]="$rpc_port"
+  NODE_PEX[$name]="$pex"
+  NODE_SENTRY[$name]="$sentry"
+
+  case "$role" in
+    validator) SCENARIO_VALIDATORS+=("$name") ;;
+    sentry) SCENARIO_SENTRIES+=("$name") ;;
+    *) die "unsupported node role ${role}" ;;
+  esac
+}
+
+gen_validator() {
+  local name="${1:?validator name required}"
+  shift || true
+
+  local rpc_port=""
+  local sentry=""
+  local pex="true"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --rpc-port)
+        rpc_port="${2:?missing rpc port}"
+        shift 2
+        ;;
+      --sentry)
+        sentry="${2:?missing sentry name}"
+        pex="false"
+        shift 2
+        ;;
+      --pex)
+        pex="${2:?missing pex value}"
+        shift 2
+        ;;
+      *)
+        die "unknown gen_validator option: $1"
+        ;;
+    esac
+  done
+
+  if [ -z "$rpc_port" ]; then
+    rpc_port="$(next_rpc_port)"
+  fi
+
+  register_node "$name" validator "$rpc_port" "$pex" "$sentry"
+}
+
+gen_sentry() {
+  local name="${1:?sentry name required}"
+  shift || true
+
+  local rpc_port=""
+  local pex="false"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --rpc-port)
+        rpc_port="${2:?missing rpc port}"
+        shift 2
+        ;;
+      --pex)
+        pex="${2:?missing pex value}"
+        shift 2
+        ;;
+      *)
+        die "unknown gen_sentry option: $1"
+        ;;
+    esac
+  done
+
+  if [ -z "$rpc_port" ]; then
+    rpc_port="$(next_rpc_port)"
+  fi
+
+  register_node "$name" sentry "$rpc_port" "$pex" ""
+}
+
+ensure_image_exists() {
+  if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+    die "docker image ${IMAGE_NAME} not found; run \`make build-image\` first"
+  fi
+}
+
+compose() {
+  docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
+}
+
+run_in_image() {
+  docker run --rm "$@" "$IMAGE_NAME"
+}
+
+init_node_dirs() {
+  local node
+  for node in "${SCENARIO_NODES[@]}"; do
+    local node_dir="${SCENARIO_DIR}/nodes/${node}"
+    NODE_DATA_DIR[$node]="$node_dir"
+    mkdir -p "$node_dir"
+
+    run_in_image -v "${node_dir}:/data" gnoland secrets init --data-dir /data/secrets >/dev/null
+    run_in_image -v "${node_dir}:/data" gnoland config init --config-path /data/config/config.toml >/dev/null
+  done
+}
+
+generate_base_genesis() {
+  [ "${#SCENARIO_VALIDATORS[@]}" -gt 0 ] || die "at least one validator is required"
+
+  local base_validator="${SCENARIO_VALIDATORS[0]}"
+  local base_dir="${NODE_DATA_DIR[$base_validator]}"
+  local lazy_container="${PROJECT_NAME}-lazy-init"
+
+  docker rm -f "$lazy_container" >/dev/null 2>&1 || true
+  docker run -d --rm \
+    --name "$lazy_container" \
+    -v "${base_dir}:/data" \
+    "$IMAGE_NAME" \
+    gnoland start \
+      -lazy \
+      -data-dir /data \
+      -genesis /data/genesis.json \
+      -chainid "$CHAIN_ID" \
+      -gnoroot-dir /gnoroot \
+      -skip-failing-genesis-txs \
+      -skip-genesis-sig-verification \
+      -log-level error >/dev/null
+
+  local i
+  for i in $(seq 1 90); do
+    if [ -f "${base_dir}/genesis.json" ]; then
+      break
+    fi
+    sleep 1
+  done
+
+  docker rm -f "$lazy_container" >/dev/null 2>&1 || true
+  [ -f "${base_dir}/genesis.json" ] || die "failed to generate base genesis"
+  cp "${base_dir}/genesis.json" "${SCENARIO_DIR}/genesis.base.json"
+}
+
+collect_node_ids() {
+  local node
+  for node in "${SCENARIO_NODES[@]}"; do
+    NODE_ID[$node]="$(run_in_image -v "${NODE_DATA_DIR[$node]}:/data" gnoland secrets get node_id.id --data-dir /data/secrets --raw | tr -d '\r\n')"
+  done
+}
+
+write_final_genesis() {
+  local base_genesis="${SCENARIO_DIR}/genesis.base.json"
+  local final_genesis="${SCENARIO_DIR}/genesis.json"
+
+  local power_json
+  power_json="$(jq -c '.validators[0].power' "$base_genesis")"
+
+  local validators_json='[]'
+  local node
+  for node in "${SCENARIO_VALIDATORS[@]}"; do
+    local validator_key="${NODE_DATA_DIR[$node]}/secrets/priv_validator_key.json"
+    local address
+    local pub_key
+    local validator_json
+
+    address="$(jq -r '.address' "$validator_key")"
+    pub_key="$(jq -c '.pub_key' "$validator_key")"
+    validator_json="$(
+      jq -cn \
+        --arg address "$address" \
+        --arg name "$node" \
+        --argjson pub_key "$pub_key" \
+        --argjson power "$power_json" \
+        '{address:$address,pub_key:$pub_key,power:$power,name:$name}'
+    )"
+    validators_json="$(jq -cn --argjson arr "$validators_json" --argjson item "$validator_json" '$arr + [$item]')"
+  done
+
+  jq \
+    --arg chain_id "$CHAIN_ID" \
+    --arg funded "${TX_ADDRESS}=${TX_BALANCE}" \
+    --argjson validators "$validators_json" \
+    '
+      .chain_id = $chain_id
+      | .validators = $validators
+      | .app_state.balances = (.app_state.balances // [])
+      | if (.app_state.balances | index($funded)) then . else .app_state.balances += [$funded] end
+    ' \
+    "$base_genesis" > "$final_genesis"
+
+  for node in "${SCENARIO_NODES[@]}"; do
+    cp "$final_genesis" "${NODE_DATA_DIR[$node]}/genesis.json"
+  done
+}
+
+format_peer_entry() {
+  local node="${1:?node required}"
+  printf '%s@%s:26656' "${NODE_ID[$node]}" "${NODE_SERVICE[$node]}"
+}
+
+persistent_peer_targets() {
+  local node="${1:?node required}"
+  local role="${NODE_ROLE[$node]}"
+  local target
+  local -a peers=()
+
+  case "$role" in
+    validator)
+      if [ -n "${NODE_SENTRY[$node]}" ]; then
+        peers+=("${NODE_SENTRY[$node]}")
+      else
+        for target in "${SCENARIO_VALIDATORS[@]}"; do
+          if [ "$target" != "$node" ] && [ -z "${NODE_SENTRY[$target]}" ]; then
+            peers+=("$target")
+          fi
+        done
+        for target in "${SCENARIO_SENTRIES[@]}"; do
+          peers+=("$target")
+        done
+      fi
+      ;;
+    sentry)
+      for target in "${SCENARIO_VALIDATORS[@]}"; do
+        if [ "$target" = "$node" ]; then
+          continue
+        fi
+        if [ -z "${NODE_SENTRY[$target]}" ] || [ "${NODE_SENTRY[$target]}" = "$node" ]; then
+          peers+=("$target")
+        fi
+      done
+      for target in "${SCENARIO_SENTRIES[@]}"; do
+        if [ "$target" != "$node" ]; then
+          peers+=("$target")
+        fi
+      done
+      ;;
+    *)
+      die "unsupported role ${role}"
+      ;;
+  esac
+
+  printf '%s\n' "${peers[@]}" | awk '!seen[$0]++ && NF'
+}
+
+persistent_peers_for_node() {
+  local node="${1:?node required}"
+  local -a rendered=()
+  local target
+
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    rendered+=("$(format_peer_entry "$target")")
+  done < <(persistent_peer_targets "$node")
+
+  join_by ',' "${rendered[@]}"
+}
+
+set_config_value() {
+  local node="${1:?node required}"
+  local key="${2:?config key required}"
+  local value="${3:?config value required}"
+
+  run_in_image -v "${NODE_DATA_DIR[$node]}:/data" \
+    gnoland config set \
+      --config-path /data/config/config.toml \
+      "$key" "$value" >/dev/null
+}
+
+configure_nodes() {
+  local node
+  for node in "${SCENARIO_NODES[@]}"; do
+    local peers
+    peers="$(persistent_peers_for_node "$node")"
+
+    set_config_value "$node" moniker "${NODE_MONIKER[$node]}"
+    set_config_value "$node" rpc.laddr "tcp://0.0.0.0:26657"
+    set_config_value "$node" p2p.laddr "tcp://0.0.0.0:26656"
+    set_config_value "$node" p2p.addr_book_strict false
+    set_config_value "$node" p2p.pex "${NODE_PEX[$node]}"
+    set_config_value "$node" p2p.persistent_peers "$peers"
+    set_config_value "$node" p2p.seeds "$peers"
+    set_config_value "$node" consensus.timeout_commit "$TIMEOUT_COMMIT"
+  done
+}
+
+write_compose_file() {
+  {
+    printf 'name: %s\n\n' "$PROJECT_NAME"
+    printf 'services:\n'
+    local node
+    for node in "${SCENARIO_NODES[@]}"; do
+      printf '  %s:\n' "${NODE_SERVICE[$node]}"
+      printf '    image: "%s"\n' "$IMAGE_NAME"
+      printf '    command:\n'
+      printf '      - gnoland\n'
+      printf '      - start\n'
+      printf '      - -skip-genesis-sig-verification\n'
+      printf '      - -data-dir\n'
+      printf '      - /data\n'
+      printf '      - -genesis\n'
+      printf '      - /data/genesis.json\n'
+      printf '      - -chainid\n'
+      printf '      - %s\n' "$CHAIN_ID"
+      printf '      - -gnoroot-dir\n'
+      printf '      - /gnoroot\n'
+      printf '      - -log-level\n'
+      printf '      - %s\n' "$LOG_LEVEL"
+      printf '    volumes:\n'
+      printf '      - "%s:/data"\n' "${NODE_DATA_DIR[$node]}"
+      printf '    ports:\n'
+      printf '      - "%s:26657"\n' "${NODE_RPC_PORT[$node]}"
+      printf '    networks:\n'
+      printf '      - chain\n'
+      printf '    stop_grace_period: 5s\n'
+    done
+    printf '\nnetworks:\n'
+    printf '  chain: {}\n'
+  } > "$COMPOSE_FILE"
+}
+
+create_tx_key() {
+  mkdir -p "$KEY_HOME"
+  if find "$KEY_HOME" -mindepth 1 -print -quit | grep -q .; then
+    return
+  fi
+
+  printf '%s\n%s\n%s\n' "$TX_MNEMONIC" "$TX_PASSWORD" "$TX_PASSWORD" | \
+    docker run -i --rm -v "${KEY_HOME}:/keys" "$IMAGE_NAME" \
+      gnokey add "$TX_KEY_NAME" --home /keys --recover --quiet --insecure-password-stdin >/dev/null
+}
+
+prepare_network() {
+  require_tools
+  ensure_image_exists
+
+  [ "${#SCENARIO_NODES[@]}" -gt 0 ] || die "no nodes declared"
+
+  rm -rf "$SCENARIO_DIR"
+  mkdir -p "$SCENARIO_DIR"
+
+  init_node_dirs
+  generate_base_genesis
+  collect_node_ids
+  write_final_genesis
+  configure_nodes
+  write_compose_file
+  create_tx_key
+
+  log "prepared network in ${SCENARIO_DIR}"
+}
+
+node_rpc_url() {
+  local node="${1:?node required}"
+  printf 'http://127.0.0.1:%s' "${NODE_RPC_PORT[$node]}"
+}
+
+wait_for_rpc() {
+  local node="${1:?node required}"
+  local timeout="${2:-60}"
+  local i
+  for i in $(seq 1 "$timeout"); do
+    if curl -fsS "$(node_rpc_url "$node")/status" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "rpc for ${node} did not come up within ${timeout}s"
+}
+
+start_node() {
+  local node="${1:?node required}"
+  compose up -d "$node" >/dev/null
+  wait_for_rpc "$node" 90
+  log "started ${node}"
+}
+
+start_validator() {
+  start_node "$1"
+}
+
+start_sentry() {
+  start_node "$1"
+}
+
+start_all_nodes() {
+  local -a ordered=()
+  local node
+  for node in "${SCENARIO_SENTRIES[@]}"; do
+    ordered+=("$node")
+  done
+  for node in "${SCENARIO_VALIDATORS[@]}"; do
+    ordered+=("$node")
+  done
+
+  [ "${#ordered[@]}" -gt 0 ] || die "no nodes to start"
+  compose up -d "${ordered[@]}" >/dev/null
+
+  for node in "${ordered[@]}"; do
+    wait_for_rpc "$node" 90
+  done
+
+  log "started ${#ordered[@]} node(s)"
+}
+
+stop_node() {
+  local node="${1:?node required}"
+  compose stop "$node" >/dev/null
+  log "stopped ${node}"
+}
+
+stop_validator() {
+  stop_node "$1"
+}
+
+stop_sentry() {
+  stop_node "$1"
+}
+
+reset_node() {
+  local node="${1:?node required}"
+  stop_node "$node" || true
+  rm -rf "${NODE_DATA_DIR[$node]}/db" "${NODE_DATA_DIR[$node]}/wal"
+  printf '{"height":"0","round":"0","step":0}\n' > "${NODE_DATA_DIR[$node]}/secrets/priv_validator_state.json"
+  cp "${SCENARIO_DIR}/genesis.json" "${NODE_DATA_DIR[$node]}/genesis.json"
+  log "reset ${node}"
+}
+
+reset_validator() {
+  reset_node "$1"
+}
+
+wait_for_seconds() {
+  local seconds="${1:?seconds required}"
+  log "waiting ${seconds}s"
+  sleep "$seconds"
+}
+
+node_height() {
+  local node="${1:?node required}"
+  curl -fsS "$(node_rpc_url "$node")/status" | jq -r '.result.sync_info.latest_block_height // "0"'
+}
+
+wait_for_height() {
+  local node="${1:?node required}"
+  local target="${2:?target height required}"
+  local timeout="${3:-120}"
+  local i
+  for i in $(seq 1 "$timeout"); do
+    local height
+    height="$(node_height "$node" 2>/dev/null || printf '0')"
+    if [ "$height" -ge "$target" ] 2>/dev/null; then
+      log "${node} reached height ${height}"
+      return 0
+    fi
+    sleep 1
+  done
+  die "${node} did not reach height ${target} within ${timeout}s"
+}
+
+wait_for_blocks() {
+  local node="${1:?node required}"
+  local delta="${2:?delta required}"
+  local timeout="${3:-120}"
+  local current
+  current="$(node_height "$node")"
+  wait_for_height "$node" "$((current + delta))" "$timeout"
+}
+
+docker_network_name() {
+  printf '%s' "$NETWORK_NAME"
+}
+
+gnokey_tx_with_password() {
+  printf '%s\n' "$TX_PASSWORD" | docker run -i --rm --network "$(docker_network_name)" -v "${KEY_HOME}:/keys" "$@"
+}
+
+add_pkg() {
+  local target_node="${1:?target node required}"
+  local pkgdir="${2:?package dir required}"
+  local pkgpath="${3:?package path required}"
+  local gas_wanted="${4:-$TX_GAS_WANTED_ADD_PKG}"
+
+  local abs_pkgdir
+  abs_pkgdir="$(cd "$pkgdir" && pwd)"
+
+  gnokey_tx_with_password \
+    -v "${abs_pkgdir}:/pkg:ro" \
+    "$IMAGE_NAME" \
+    gnokey maketx addpkg \
+      --pkgdir /pkg \
+      --pkgpath "$pkgpath" \
+      --gas-fee "$TX_GAS_FEE" \
+      --gas-wanted "$gas_wanted" \
+      --broadcast=true \
+      --chainid "$CHAIN_ID" \
+      --remote "${NODE_SERVICE[$target_node]}:26657" \
+      --home /keys \
+      --insecure-password-stdin \
+      "$TX_KEY_NAME"
+}
+
+call_realm() {
+  local target_node="${1:?target node required}"
+  local pkgpath="${2:?package path required}"
+  local func_name="${3:?function name required}"
+  shift 3 || true
+
+  local -a cmd=(
+    gnokey maketx call
+    --pkgpath "$pkgpath"
+    --func "$func_name"
+    --gas-fee "$TX_GAS_FEE"
+    --gas-wanted "$TX_GAS_WANTED_CALL"
+    --broadcast=true
+    --chainid "$CHAIN_ID"
+    --remote "${NODE_SERVICE[$target_node]}:26657"
+    --home /keys
+    --insecure-password-stdin
+  )
+
+  local arg
+  for arg in "$@"; do
+    cmd+=(--args "$arg")
+  done
+  cmd+=("$TX_KEY_NAME")
+
+  gnokey_tx_with_password "$IMAGE_NAME" "${cmd[@]}"
+}
+
+run_script() {
+  local target_node="${1:?target node required}"
+  local script_path="${2:?script path required}"
+  local gas_wanted="${3:-$TX_GAS_WANTED_RUN}"
+
+  local abs_script
+  local script_dir
+  local script_name
+  abs_script="$(cd "$(dirname "$script_path")" && pwd)/$(basename "$script_path")"
+  script_dir="$(dirname "$abs_script")"
+  script_name="$(basename "$abs_script")"
+
+  gnokey_tx_with_password \
+    -v "${script_dir}:/script:ro" \
+    "$IMAGE_NAME" \
+    gnokey maketx run \
+      --gas-fee "$TX_GAS_FEE" \
+      --gas-wanted "$gas_wanted" \
+      --broadcast=true \
+      --chainid "$CHAIN_ID" \
+      --remote "${NODE_SERVICE[$target_node]}:26657" \
+      --home /keys \
+      --insecure-password-stdin \
+      "$TX_KEY_NAME" \
+      "/script/${script_name}"
+}
+
+send_coins() {
+  local target_node="${1:?target node required}"
+  local to_addr="${2:?destination address required}"
+  local amount="${3:?amount required}"
+
+  gnokey_tx_with_password \
+    "$IMAGE_NAME" \
+    gnokey maketx send \
+      --to "$to_addr" \
+      --send "$amount" \
+      --gas-fee "$TX_GAS_FEE" \
+      --gas-wanted "$TX_GAS_WANTED_SEND" \
+      --broadcast=true \
+      --chainid "$CHAIN_ID" \
+      --remote "${NODE_SERVICE[$target_node]}:26657" \
+      --home /keys \
+      --insecure-password-stdin \
+      "$TX_KEY_NAME"
+}
+
+do_transaction() {
+  local kind="${1:?transaction kind required}"
+  shift || true
+
+  case "$kind" in
+    addpkg) add_pkg "$@" ;;
+    call) call_realm "$@" ;;
+    run) run_script "$@" ;;
+    send) send_coins "$@" ;;
+    *) die "unsupported transaction kind ${kind}" ;;
+  esac
+}
+
+query_render() {
+  local target_node="${1:?target node required}"
+  local expr="${2:?render expression required}"
+
+  docker run --rm --network "$(docker_network_name)" "$IMAGE_NAME" \
+    gnokey query vm/qrender --data "$expr" --remote "${NODE_SERVICE[$target_node]}:26657"
+}
+
+container_id_for_node() {
+  compose ps -q "$1"
+}
+
+node_ip() {
+  local node="${1:?node required}"
+  local container_id
+  container_id="$(container_id_for_node "$node")"
+  [ -n "$container_id" ] || return 1
+  docker inspect "$container_id" | jq -r --arg network "$(docker_network_name)" '.[0].NetworkSettings.Networks[$network].IPAddress // empty'
+}
+
+rotate_sentry_ip() {
+  local sentry="${1:?sentry name required}"
+  [ "${NODE_ROLE[$sentry]:-}" = "sentry" ] || die "${sentry} is not a sentry"
+
+  local old_ip
+  local new_ip
+  local bumper
+  local bumper2
+
+  old_ip="$(node_ip "$sentry" || true)"
+  bumper="${PROJECT_NAME}-${sentry}-bump-1"
+  bumper2="${PROJECT_NAME}-${sentry}-bump-2"
+
+  compose stop "$sentry" >/dev/null
+  compose rm -f "$sentry" >/dev/null
+  docker rm -f "$bumper" "$bumper2" >/dev/null 2>&1 || true
+
+  docker run -d --rm --name "$bumper" --network "$(docker_network_name)" "$IMAGE_NAME" sh -c 'sleep 300' >/dev/null
+  compose up -d "$sentry" >/dev/null
+  wait_for_rpc "$sentry" 90
+  new_ip="$(node_ip "$sentry" || true)"
+
+  if [ -n "$old_ip" ] && [ "$old_ip" = "$new_ip" ]; then
+    compose stop "$sentry" >/dev/null
+    compose rm -f "$sentry" >/dev/null
+    docker run -d --rm --name "$bumper2" --network "$(docker_network_name)" "$IMAGE_NAME" sh -c 'sleep 300' >/dev/null
+    compose up -d "$sentry" >/dev/null
+    wait_for_rpc "$sentry" 90
+    new_ip="$(node_ip "$sentry" || true)"
+  fi
+
+  docker rm -f "$bumper" "$bumper2" >/dev/null 2>&1 || true
+  log "sentry ${sentry} IP ${old_ip:-unknown} -> ${new_ip:-unknown}"
+}
+
+print_cluster_status() {
+  local node
+  for node in "${SCENARIO_NODES[@]}"; do
+    if curl -fsS "$(node_rpc_url "$node")/status" >/dev/null 2>&1; then
+      printf '%-16s role=%-10s height=%s rpc=%s\n' \
+        "$node" \
+        "${NODE_ROLE[$node]}" \
+        "$(node_height "$node")" \
+        "$(node_rpc_url "$node")"
+    else
+      printf '%-16s role=%-10s state=stopped rpc=%s\n' \
+        "$node" \
+        "${NODE_ROLE[$node]}" \
+        "$(node_rpc_url "$node")"
+    fi
+  done
+}
+
+scenario_finish() {
+  local -a bumpers=( ${PROJECT_NAME}-*-bump-1(N) ${PROJECT_NAME}-*-bump-2(N) )
+  if [ "${#bumpers[@]}" -gt 0 ]; then
+    docker rm -f "${bumpers[@]}" >/dev/null 2>&1 || true
+  fi
+  if [ "${KEEP_UP:-0}" = "1" ]; then
+    log "leaving network running because KEEP_UP=1"
+    return 0
+  fi
+  if [ -f "$COMPOSE_FILE" ]; then
+    compose down --remove-orphans >/dev/null 2>&1 || true
+  fi
+}

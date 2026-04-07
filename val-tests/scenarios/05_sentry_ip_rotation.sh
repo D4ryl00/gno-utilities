@@ -1,0 +1,24 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT_DIR="${0:A:h:h}"
+source "${ROOT_DIR}/lib/scenario.sh"
+
+scenario_init "sentry-ip-rotation"
+trap scenario_finish EXIT
+
+gen_validator val1
+gen_validator val2
+gen_validator val3
+gen_sentry sentry1
+gen_validator val4 --sentry sentry1
+gen_validator val5 --sentry sentry1
+
+prepare_network
+start_all_nodes
+wait_for_seconds 60
+
+rotate_sentry_ip sentry1
+wait_for_blocks val4 5 120
+
+print_cluster_status
