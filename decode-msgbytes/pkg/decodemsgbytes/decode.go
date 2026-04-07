@@ -9,6 +9,7 @@ import (
 
 	_ "github.com/gnolang/gno/gno.land/pkg/sdk/vm"
 	"github.com/gnolang/gno/tm2/pkg/amino"
+	_ "github.com/gnolang/gno/tm2/pkg/bft/consensus"
 	"github.com/gnolang/gno/tm2/pkg/bft/mempool"
 	"github.com/gnolang/gno/tm2/pkg/std"
 
@@ -70,8 +71,8 @@ func DecodeHex(hexStr string) (*Result, error) {
 }
 
 func DecodeBytes(rawHex string, raw []byte) (*Result, error) {
-	var outer mempool.MempoolMessage
-	if err := amino.UnmarshalAny(raw, &outer); err != nil {
+	var outer any
+	if err := amino.Unmarshal(raw, &outer); err != nil {
 		return nil, err
 	}
 

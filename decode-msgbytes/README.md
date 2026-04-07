@@ -27,6 +27,11 @@ It prints:
 - the outer Amino JSON
 - the inner `std.Tx` Amino JSON when the payload is a mempool `TxMessage`
 
+Supported outer messages include:
+
+- mempool `tm.TxMessage`
+- consensus messages such as `tm.NewRoundStepMessage`
+
 ## Example
 
 ```sh
