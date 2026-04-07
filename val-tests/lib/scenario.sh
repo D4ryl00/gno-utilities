@@ -1,13 +1,18 @@
-#!/usr/bin/env zsh
-emulate -L zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
-SCENARIO_SELF="${(%):-%N}"
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  printf 'error: bash 4+ required (found %s); install with: brew install bash\n' "$BASH_VERSION" >&2
+  exit 1
+fi
+
+SCENARIO_SELF="${BASH_SOURCE[0]}"
 SCENARIO_LIB_DIR="$(cd "$(dirname "${SCENARIO_SELF}")" && pwd)"
 REPO_ROOT="$(cd "${SCENARIO_LIB_DIR}/.." && pwd)"
 
-IMAGE_NAME="${IMAGE_NAME:-gno-scenario-all:local}"
-WORK_ROOT="${WORK_ROOT:-${REPO_ROOT}/.work}"
+IMAGE_NAME="${IMAGE_NAME:-gnoland:local}"
+GNOKEY_IMAGE="${GNOKEY_IMAGE:-gnokey:local}"
+WORK_ROOT="${WORK_ROOT:-/tmp/gno-val-tests}"
 CHAIN_ID="${CHAIN_ID:-dev}"
 TIMEOUT_COMMIT="${TIMEOUT_COMMIT:-1s}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
@@ -22,17 +27,17 @@ TX_GAS_WANTED_CALL="${TX_GAS_WANTED_CALL:-3000000}"
 TX_GAS_WANTED_RUN="${TX_GAS_WANTED_RUN:-5000000}"
 TX_GAS_WANTED_SEND="${TX_GAS_WANTED_SEND:-2000000}"
 
-typeset -ga SCENARIO_NODES=()
-typeset -ga SCENARIO_VALIDATORS=()
-typeset -ga SCENARIO_SENTRIES=()
-typeset -gA NODE_ROLE=()
-typeset -gA NODE_SERVICE=()
-typeset -gA NODE_MONIKER=()
-typeset -gA NODE_RPC_PORT=()
-typeset -gA NODE_PEX=()
-typeset -gA NODE_SENTRY=()
-typeset -gA NODE_ID=()
-typeset -gA NODE_DATA_DIR=()
+declare -a SCENARIO_NODES=()
+declare -a SCENARIO_VALIDATORS=()
+declare -a SCENARIO_SENTRIES=()
+declare -A NODE_ROLE=()
+declare -A NODE_SERVICE=()
+declare -A NODE_MONIKER=()
+declare -A NODE_RPC_PORT=()
+declare -A NODE_PEX=()
+declare -A NODE_SENTRY=()
+declare -A NODE_ID=()
+declare -A NODE_DATA_DIR=()
 
 SCENARIO_NAME=""
 PROJECT_NAME=""
@@ -93,6 +98,8 @@ scenario_init() {
   COMPOSE_FILE="${SCENARIO_DIR}/docker-compose.yml"
   KEY_HOME="${SCENARIO_DIR}/keys"
   NETWORK_NAME="${PROJECT_NAME}_chain"
+
+  printf '[%s] scenario dir: %s\n' "$SCENARIO_NAME" "$SCENARIO_DIR"
 
   SCENARIO_NODES=()
   SCENARIO_VALIDATORS=()
@@ -202,8 +209,14 @@ gen_sentry() {
 }
 
 ensure_image_exists() {
-  if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-    die "docker image ${IMAGE_NAME} not found; run \`make build-image\` first"
+  local image_id
+  image_id="$(docker images -q "$IMAGE_NAME" 2>/dev/null)"
+  if [ -z "$image_id" ]; then
+    die "docker image ${IMAGE_NAME} not found; run \`make build-gnoland-image\` first"
+  fi
+  image_id="$(docker images -q "$GNOKEY_IMAGE" 2>/dev/null)"
+  if [ -z "$image_id" ]; then
+    die "docker image ${GNOKEY_IMAGE} not found; run \`make build-gnokey-image\` first"
   fi
 }
 
@@ -212,7 +225,7 @@ compose() {
 }
 
 run_in_image() {
-  docker run --rm "$@" "$IMAGE_NAME"
+  docker run --rm "$@"
 }
 
 init_node_dirs() {
@@ -222,8 +235,8 @@ init_node_dirs() {
     NODE_DATA_DIR[$node]="$node_dir"
     mkdir -p "$node_dir"
 
-    run_in_image -v "${node_dir}:/data" gnoland secrets init --data-dir /data/secrets >/dev/null
-    run_in_image -v "${node_dir}:/data" gnoland config init --config-path /data/config/config.toml >/dev/null
+    run_in_image -v "${node_dir}:/data" "$IMAGE_NAME" secrets init --data-dir /data/secrets >/dev/null
+    run_in_image -v "${node_dir}:/data" "$IMAGE_NAME" config init --config-path /data/config/config.toml >/dev/null
   done
 }
 
@@ -239,7 +252,7 @@ generate_base_genesis() {
     --name "$lazy_container" \
     -v "${base_dir}:/data" \
     "$IMAGE_NAME" \
-    gnoland start \
+    start \
       -lazy \
       -data-dir /data \
       -genesis /data/genesis.json \
@@ -265,7 +278,7 @@ generate_base_genesis() {
 collect_node_ids() {
   local node
   for node in "${SCENARIO_NODES[@]}"; do
-    NODE_ID[$node]="$(run_in_image -v "${NODE_DATA_DIR[$node]}:/data" gnoland secrets get node_id.id --data-dir /data/secrets --raw | tr -d '\r\n')"
+    NODE_ID[$node]="$(run_in_image -v "${NODE_DATA_DIR[$node]}:/data" "$IMAGE_NAME" secrets get node_id.id --data-dir /data/secrets --raw | tr -d '\r\n')"
   done
 }
 
@@ -381,8 +394,8 @@ set_config_value() {
   local key="${2:?config key required}"
   local value="${3:?config value required}"
 
-  run_in_image -v "${NODE_DATA_DIR[$node]}:/data" \
-    gnoland config set \
+  run_in_image -v "${NODE_DATA_DIR[$node]}:/data" "$IMAGE_NAME" \
+    config set \
       --config-path /data/config/config.toml \
       "$key" "$value" >/dev/null
 }
@@ -396,7 +409,6 @@ configure_nodes() {
     set_config_value "$node" moniker "${NODE_MONIKER[$node]}"
     set_config_value "$node" rpc.laddr "tcp://0.0.0.0:26657"
     set_config_value "$node" p2p.laddr "tcp://0.0.0.0:26656"
-    set_config_value "$node" p2p.addr_book_strict false
     set_config_value "$node" p2p.pex "${NODE_PEX[$node]}"
     set_config_value "$node" p2p.persistent_peers "$peers"
     set_config_value "$node" p2p.seeds "$peers"
@@ -413,7 +425,6 @@ write_compose_file() {
       printf '  %s:\n' "${NODE_SERVICE[$node]}"
       printf '    image: "%s"\n' "$IMAGE_NAME"
       printf '    command:\n'
-      printf '      - gnoland\n'
       printf '      - start\n'
       printf '      - -skip-genesis-sig-verification\n'
       printf '      - -data-dir\n'
@@ -446,8 +457,8 @@ create_tx_key() {
   fi
 
   printf '%s\n%s\n%s\n' "$TX_MNEMONIC" "$TX_PASSWORD" "$TX_PASSWORD" | \
-    docker run -i --rm -v "${KEY_HOME}:/keys" "$IMAGE_NAME" \
-      gnokey add "$TX_KEY_NAME" --home /keys --recover --quiet --insecure-password-stdin >/dev/null
+    docker run -i --rm -v "${KEY_HOME}:/keys" "$GNOKEY_IMAGE" \
+      add "$TX_KEY_NAME" --home /keys --recover --quiet --insecure-password-stdin >/dev/null
 }
 
 prepare_network() {
@@ -488,10 +499,17 @@ wait_for_rpc() {
   die "rpc for ${node} did not come up within ${timeout}s"
 }
 
+_capture_node_logs() {
+  local node="${1:?node required}"
+  mkdir -p "${SCENARIO_DIR}/logs"
+  compose logs -f "$node" >> "${SCENARIO_DIR}/logs/${node}.log" 2>&1 &
+}
+
 start_node() {
   local node="${1:?node required}"
   compose up -d "$node" >/dev/null
   wait_for_rpc "$node" 90
+  _capture_node_logs "$node"
   log "started ${node}"
 }
 
@@ -518,6 +536,7 @@ start_all_nodes() {
 
   for node in "${ordered[@]}"; do
     wait_for_rpc "$node" 90
+    _capture_node_logs "$node"
   done
 
   log "started ${#ordered[@]} node(s)"
@@ -592,7 +611,7 @@ docker_network_name() {
 }
 
 gnokey_tx_with_password() {
-  printf '%s\n' "$TX_PASSWORD" | docker run -i --rm --network "$(docker_network_name)" -v "${KEY_HOME}:/keys" "$@"
+  printf '%s\n' "$TX_PASSWORD" | docker run -i --rm --network "$(docker_network_name)" -v "${KEY_HOME}:/keys" "$GNOKEY_IMAGE" "$@"
 }
 
 add_pkg() {
@@ -606,8 +625,7 @@ add_pkg() {
 
   gnokey_tx_with_password \
     -v "${abs_pkgdir}:/pkg:ro" \
-    "$IMAGE_NAME" \
-    gnokey maketx addpkg \
+    maketx addpkg \
       --pkgdir /pkg \
       --pkgpath "$pkgpath" \
       --gas-fee "$TX_GAS_FEE" \
@@ -627,7 +645,7 @@ call_realm() {
   shift 3 || true
 
   local -a cmd=(
-    gnokey maketx call
+    maketx call
     --pkgpath "$pkgpath"
     --func "$func_name"
     --gas-fee "$TX_GAS_FEE"
@@ -645,7 +663,7 @@ call_realm() {
   done
   cmd+=("$TX_KEY_NAME")
 
-  gnokey_tx_with_password "$IMAGE_NAME" "${cmd[@]}"
+  gnokey_tx_with_password "${cmd[@]}"
 }
 
 run_script() {
@@ -662,8 +680,7 @@ run_script() {
 
   gnokey_tx_with_password \
     -v "${script_dir}:/script:ro" \
-    "$IMAGE_NAME" \
-    gnokey maketx run \
+    maketx run \
       --gas-fee "$TX_GAS_FEE" \
       --gas-wanted "$gas_wanted" \
       --broadcast=true \
@@ -681,8 +698,7 @@ send_coins() {
   local amount="${3:?amount required}"
 
   gnokey_tx_with_password \
-    "$IMAGE_NAME" \
-    gnokey maketx send \
+    maketx send \
       --to "$to_addr" \
       --send "$amount" \
       --gas-fee "$TX_GAS_FEE" \
@@ -712,8 +728,8 @@ query_render() {
   local target_node="${1:?target node required}"
   local expr="${2:?render expression required}"
 
-  docker run --rm --network "$(docker_network_name)" "$IMAGE_NAME" \
-    gnokey query vm/qrender --data "$expr" --remote "${NODE_SERVICE[$target_node]}:26657"
+  docker run --rm --network "$(docker_network_name)" "$GNOKEY_IMAGE" \
+    query vm/qrender --data "$expr" --remote "${NODE_SERVICE[$target_node]}:26657"
 }
 
 container_id_for_node() {
@@ -745,7 +761,7 @@ rotate_sentry_ip() {
   compose rm -f "$sentry" >/dev/null
   docker rm -f "$bumper" "$bumper2" >/dev/null 2>&1 || true
 
-  docker run -d --rm --name "$bumper" --network "$(docker_network_name)" "$IMAGE_NAME" sh -c 'sleep 300' >/dev/null
+  docker run -d --rm --entrypoint sh --name "$bumper" --network "$(docker_network_name)" "$IMAGE_NAME" -c 'sleep 300' >/dev/null
   compose up -d "$sentry" >/dev/null
   wait_for_rpc "$sentry" 90
   new_ip="$(node_ip "$sentry" || true)"
@@ -782,10 +798,11 @@ print_cluster_status() {
 }
 
 scenario_finish() {
-  local -a bumpers=( ${PROJECT_NAME}-*-bump-1(N) ${PROJECT_NAME}-*-bump-2(N) )
-  if [ "${#bumpers[@]}" -gt 0 ]; then
-    docker rm -f "${bumpers[@]}" >/dev/null 2>&1 || true
-  fi
+  docker rm -f "${PROJECT_NAME}-lazy-init" >/dev/null 2>&1 || true
+  local sentry
+  for sentry in "${SCENARIO_SENTRIES[@]+"${SCENARIO_SENTRIES[@]}"}"; do
+    docker rm -f "${PROJECT_NAME}-${sentry}-bump-1" "${PROJECT_NAME}-${sentry}-bump-2" >/dev/null 2>&1 || true
+  done
   if [ "${KEEP_UP:-0}" = "1" ]; then
     log "leaving network running because KEEP_UP=1"
     return 0
