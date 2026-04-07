@@ -1,7 +1,9 @@
-IMAGE        ?= gnoland:local
-GNOKEY_IMAGE ?= gnokey:local
-WORK_ROOT    ?= /tmp/gno-val-tests
-NODE         ?=
+IMAGE             ?= gnoland:local
+GNOKEY_IMAGE      ?= gnokey:local
+GNOGENESIS_IMAGE  ?= gnogenesis:local
+GNO_ROOT          ?= $(shell pwd)/gno
+WORK_ROOT         ?= /tmp/gno-val-tests
+NODE              ?=
 
 PROJECT_01 = five-validators-reset-four
 PROJECT_02 = four-validators-restart-staggered
@@ -9,17 +11,29 @@ PROJECT_03 = four-validators-restart-parallel
 PROJECT_04 = counter-realm-churn
 PROJECT_05 = sentry-ip-rotation
 
-.PHONY: build-gnoland-image build-gnokey-image \
+.PHONY: build-gnoland-image build-gnokey-image build-gnogenesis-image build-images clone-gno \
         scenario-01 scenario-02 scenario-03 scenario-04 scenario-05 \
         logs-01 logs-02 logs-03 logs-04 logs-05 \
         clean clean-01 clean-02 clean-03 clean-04 clean-05 \
         status
 
+clone-gno:
+	@if [ -d "$(GNO_ROOT)" ]; then \
+		echo "$(GNO_ROOT) already exists, skipping clone"; \
+	else \
+		git clone https://github.com/gnolang/gno.git $(GNO_ROOT); \
+	fi
+
 build-gnoland-image:
-	docker build -t $(IMAGE) -f ../gno/Dockerfile --target gnoland ../gno
+	docker build -t $(IMAGE) -f $(GNO_ROOT)/Dockerfile --target gnoland $(GNO_ROOT)
 
 build-gnokey-image:
-	docker build -t $(GNOKEY_IMAGE) -f ../gno/Dockerfile --target gnokey ../gno
+	docker build -t $(GNOKEY_IMAGE) -f $(GNO_ROOT)/Dockerfile --target gnokey $(GNO_ROOT)
+
+build-gnogenesis-image:
+	docker build -t $(GNOGENESIS_IMAGE) -f $(GNO_ROOT)/Dockerfile --target gnocontribs $(GNO_ROOT)
+
+build-images: build-gnoland-image build-gnokey-image build-gnogenesis-image
 
 clean:
 	rm -rf $(WORK_ROOT)
@@ -40,19 +54,19 @@ clean-05:
 	rm -rf $(WORK_ROOT)/$(PROJECT_05)
 
 scenario-01:
-	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) WORK_ROOT=$(WORK_ROOT) ./scenarios/01_five_validators_reset_four.sh
+	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) GNOGENESIS_IMAGE=$(GNOGENESIS_IMAGE) GNO_ROOT=$(GNO_ROOT) WORK_ROOT=$(WORK_ROOT) ./scenarios/01_five_validators_reset_four.sh
 
 scenario-02:
-	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) WORK_ROOT=$(WORK_ROOT) ./scenarios/02_four_validators_restart_staggered.sh
+	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) GNOGENESIS_IMAGE=$(GNOGENESIS_IMAGE) GNO_ROOT=$(GNO_ROOT) WORK_ROOT=$(WORK_ROOT) ./scenarios/02_four_validators_restart_staggered.sh
 
 scenario-03:
-	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) WORK_ROOT=$(WORK_ROOT) ./scenarios/03_four_validators_restart_parallel.sh
+	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) GNOGENESIS_IMAGE=$(GNOGENESIS_IMAGE) GNO_ROOT=$(GNO_ROOT) WORK_ROOT=$(WORK_ROOT) ./scenarios/03_four_validators_restart_parallel.sh
 
 scenario-04:
-	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) WORK_ROOT=$(WORK_ROOT) ./scenarios/04_counter_realm_churn.sh
+	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) GNOGENESIS_IMAGE=$(GNOGENESIS_IMAGE) GNO_ROOT=$(GNO_ROOT) WORK_ROOT=$(WORK_ROOT) ./scenarios/04_counter_realm_churn.sh
 
 scenario-05:
-	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) WORK_ROOT=$(WORK_ROOT) ./scenarios/05_sentry_ip_rotation.sh
+	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) GNOGENESIS_IMAGE=$(GNOGENESIS_IMAGE) GNO_ROOT=$(GNO_ROOT) WORK_ROOT=$(WORK_ROOT) ./scenarios/05_sentry_ip_rotation.sh
 
 logs-01:
 	docker compose -p $(PROJECT_01) logs -f $(NODE)

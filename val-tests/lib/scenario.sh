@@ -12,6 +12,8 @@ REPO_ROOT="$(cd "${SCENARIO_LIB_DIR}/.." && pwd)"
 
 IMAGE_NAME="${IMAGE_NAME:-gnoland:local}"
 GNOKEY_IMAGE="${GNOKEY_IMAGE:-gnokey:local}"
+GNOGENESIS_IMAGE="${GNOGENESIS_IMAGE:-gnogenesis:local}"
+GNO_ROOT="${GNO_ROOT:-${REPO_ROOT}/gno}"
 WORK_ROOT="${WORK_ROOT:-/tmp/gno-val-tests}"
 CHAIN_ID="${CHAIN_ID:-dev}"
 TIMEOUT_COMMIT="${TIMEOUT_COMMIT:-1s}"
@@ -22,7 +24,7 @@ TX_MNEMONIC="${TX_MNEMONIC:-source bonus chronic canvas draft south burst lotter
 TX_ADDRESS="${TX_ADDRESS:-g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5}"
 TX_BALANCE="${TX_BALANCE:-100000000000ugnot}"
 TX_GAS_FEE="${TX_GAS_FEE:-1000000ugnot}"
-TX_GAS_WANTED_ADD_PKG="${TX_GAS_WANTED_ADD_PKG:-7000000}"
+TX_GAS_WANTED_ADD_PKG="${TX_GAS_WANTED_ADD_PKG:-50000000}"
 TX_GAS_WANTED_CALL="${TX_GAS_WANTED_CALL:-3000000}"
 TX_GAS_WANTED_RUN="${TX_GAS_WANTED_RUN:-5000000}"
 TX_GAS_WANTED_SEND="${TX_GAS_WANTED_SEND:-2000000}"
@@ -37,6 +39,8 @@ declare -A NODE_RPC_PORT=()
 declare -A NODE_PEX=()
 declare -A NODE_SENTRY=()
 declare -A NODE_ID=()
+declare -A NODE_ADDRESS=()
+declare -A NODE_PUBKEY=()
 declare -A NODE_DATA_DIR=()
 
 SCENARIO_NAME=""
@@ -111,6 +115,8 @@ scenario_init() {
   NODE_PEX=()
   NODE_SENTRY=()
   NODE_ID=()
+  NODE_ADDRESS=()
+  NODE_PUBKEY=()
   NODE_DATA_DIR=()
 }
 
@@ -218,6 +224,10 @@ ensure_image_exists() {
   if [ -z "$image_id" ]; then
     die "docker image ${GNOKEY_IMAGE} not found; run \`make build-gnokey-image\` first"
   fi
+  image_id="$(docker images -q "$GNOGENESIS_IMAGE" 2>/dev/null)"
+  if [ -z "$image_id" ]; then
+    die "docker image ${GNOGENESIS_IMAGE} not found; run \`make build-gnogenesis-image\` first"
+  fi
 }
 
 compose() {
@@ -240,90 +250,135 @@ init_node_dirs() {
   done
 }
 
-generate_base_genesis() {
-  [ "${#SCENARIO_VALIDATORS[@]}" -gt 0 ] || die "at least one validator is required"
-
-  local base_validator="${SCENARIO_VALIDATORS[0]}"
-  local base_dir="${NODE_DATA_DIR[$base_validator]}"
-  local lazy_container="${PROJECT_NAME}-lazy-init"
-
-  docker rm -f "$lazy_container" >/dev/null 2>&1 || true
-  docker run -d --rm \
-    --name "$lazy_container" \
-    -v "${base_dir}:/data" \
-    "$IMAGE_NAME" \
-    start \
-      -lazy \
-      -data-dir /data \
-      -genesis /data/genesis.json \
-      -chainid "$CHAIN_ID" \
-      -gnoroot-dir /gnoroot \
-      -skip-failing-genesis-txs \
-      -skip-genesis-sig-verification \
-      -log-level error >/dev/null
-
-  local i
-  for i in $(seq 1 90); do
-    if [ -f "${base_dir}/genesis.json" ]; then
-      break
-    fi
-    sleep 1
-  done
-
-  docker rm -f "$lazy_container" >/dev/null 2>&1 || true
-  [ -f "${base_dir}/genesis.json" ] || die "failed to generate base genesis"
-  cp "${base_dir}/genesis.json" "${SCENARIO_DIR}/genesis.base.json"
-}
-
 collect_node_ids() {
   local node
   for node in "${SCENARIO_NODES[@]}"; do
     NODE_ID[$node]="$(run_in_image -v "${NODE_DATA_DIR[$node]}:/data" "$IMAGE_NAME" secrets get node_id.id --data-dir /data/secrets --raw | tr -d '\r\n')"
+    NODE_ADDRESS[$node]="$(run_in_image -v "${NODE_DATA_DIR[$node]}:/data" "$IMAGE_NAME" secrets get validator_key.address --data-dir /data/secrets --raw | tr -d '\r\n')"
+    NODE_PUBKEY[$node]="$(run_in_image -v "${NODE_DATA_DIR[$node]}:/data" "$IMAGE_NAME" secrets get validator_key.pub_key --data-dir /data/secrets --raw | tr -d '\r\n')"
   done
 }
 
-write_final_genesis() {
-  local base_genesis="${SCENARIO_DIR}/genesis.base.json"
-  local final_genesis="${SCENARIO_DIR}/genesis.json"
+# _gnogenesis runs a gnogenesis command with the scenario genesis and GNO_ROOT mounted.
+# Callers must include --genesis-path /work/genesis.json after the subcommand name.
+# Uses --entrypoint gnogenesis because gnocontribs image ENTRYPOINT is /bin/sh -c.
+_gnogenesis() {
+  docker run --rm \
+    --entrypoint gnogenesis \
+    -v "${SCENARIO_DIR}:/work" \
+    -v "${GNO_ROOT}:/gnoroot:ro" \
+    "$GNOGENESIS_IMAGE" \
+    "$@"
+}
 
-  local power_json
-  power_json="$(jq -c '.validators[0].power' "$base_genesis")"
+# _gnokey_deployer runs a gnokey command with the genesis deployer key home mounted.
+_gnokey_deployer() {
+  docker run -i --rm \
+    -v "${SCENARIO_DIR}:/work" \
+    "$GNOKEY_IMAGE" \
+    "$@"
+}
 
-  local validators_json='[]'
+generate_genesis() {
+  [ "${#SCENARIO_VALIDATORS[@]}" -gt 0 ] || die "at least one validator is required"
+  [ -d "${GNO_ROOT}/examples" ] || die "GNO_ROOT examples not found at ${GNO_ROOT}/examples; run 'make clone-gno' or set GNO_ROOT"
+
+  local genesis_work="${SCENARIO_DIR}/genesis-work"
+  local gnokey_home="${genesis_work}/gnokey-home"
+  local deployer_name="GenesisDeployer"
+  # Same mnemonic as gen-genesis.sh; address = g1edq4dugw0sgat4zxcw9xardvuydqf6cgleuc8p
+  local deployer_mnemonic="anchor hurt name seed oak spread anchor filter lesson shaft wasp home improve text behind toe segment lamp turn marriage female royal twice wealth"
+
+  mkdir -p "$genesis_work" "$gnokey_home"
+
+  log "creating genesis deployer key"
+  printf '%s\n\n' "$deployer_mnemonic" | \
+    docker run -i --rm \
+      -v "${gnokey_home}:/keys" \
+      "$GNOKEY_IMAGE" \
+      add --recover "$deployer_name" --home /keys --insecure-password-stdin >/dev/null
+
+  log "generating empty genesis"
+  docker run --rm \
+    --entrypoint gnogenesis \
+    -v "${genesis_work}:/work" \
+    "$GNOGENESIS_IMAGE" \
+    generate \
+      --chain-id "$CHAIN_ID" \
+      --genesis-time "$(date +%s)" \
+      --output-path /work/genesis.json >/dev/null
+
+  # Copy genesis to the scenario work dir where _gnogenesis mounts it
+  cp "${genesis_work}/genesis.json" "${SCENARIO_DIR}/genesis.json"
+
+  log "adding packages from GNO_ROOT"
+  printf '\n' | \
+    docker run -i --rm \
+      --entrypoint gnogenesis \
+      -v "${SCENARIO_DIR}:/work" \
+      -v "${GNO_ROOT}:/gnoroot:ro" \
+      -v "${gnokey_home}:/keys" \
+      "$GNOGENESIS_IMAGE" \
+      txs add packages /gnoroot/examples \
+        --genesis-path /work/genesis.json \
+        --gno-home /keys \
+        --key-name "$deployer_name" \
+        --insecure-password-stdin >/dev/null
+
+  log "generating valset-init MsgRun"
+  local valset_file="${genesis_work}/valset-init.gno"
+  local valset_entries=""
   local node
   for node in "${SCENARIO_VALIDATORS[@]}"; do
-    local validator_key="${NODE_DATA_DIR[$node]}/secrets/priv_validator_key.json"
-    local address
-    local pub_key
-    local validator_json
+    valset_entries+="$(printf '\t\t\t\t{Address: address("%s"), PubKey: "%s", VotingPower: 10},\n' \
+      "${NODE_ADDRESS[$node]}" "${NODE_PUBKEY[$node]}")"
+  done
+  awk -v entries="$valset_entries" \
+    '/\/\/ GEN:VALSET/ { printf "%s", entries; next } { print }' \
+    "${SCENARIO_LIB_DIR}/valset-init.gno.tpl" > "$valset_file"
 
-    address="$(jq -r '.address' "$validator_key")"
-    pub_key="$(jq -c '.pub_key' "$validator_key")"
-    validator_json="$(
-      jq -cn \
-        --arg address "$address" \
-        --arg name "$node" \
-        --argjson pub_key "$pub_key" \
-        --argjson power "$power_json" \
-        '{address:$address,pub_key:$pub_key,power:$power,name:$name}'
-    )"
-    validators_json="$(jq -cn --argjson arr "$validators_json" --argjson item "$validator_json" '$arr + [$item]')"
+  local setup_tx="${genesis_work}/valset-init-tx.json"
+  local setup_tx_jsonl="${genesis_work}/valset-init-tx.jsonl"
+
+  _gnokey_deployer \
+    maketx run \
+      --gas-wanted 100000000 \
+      --gas-fee 1ugnot \
+      --chainid "$CHAIN_ID" \
+      --home /work/genesis-work/gnokey-home \
+      "$deployer_name" \
+      /work/genesis-work/valset-init.gno > "$setup_tx"
+
+  printf '\n' | _gnokey_deployer \
+    sign \
+      --tx-path /work/genesis-work/valset-init-tx.json \
+      --chainid "$CHAIN_ID" \
+      --account-number 0 \
+      --account-sequence 0 \
+      --home /work/genesis-work/gnokey-home \
+      --insecure-password-stdin \
+      "$deployer_name" >/dev/null
+
+  jq -c '{tx: .}' < "$setup_tx" > "$setup_tx_jsonl"
+
+  _gnogenesis txs add sheets --genesis-path /work/genesis.json /work/genesis-work/valset-init-tx.jsonl >/dev/null
+
+  log "adding ${#SCENARIO_VALIDATORS[@]} validators to consensus layer"
+  for node in "${SCENARIO_VALIDATORS[@]}"; do
+    _gnogenesis validator add \
+      --genesis-path /work/genesis.json \
+      --name "$node" \
+      --address "${NODE_ADDRESS[$node]}" \
+      --pub-key "${NODE_PUBKEY[$node]}" \
+      --power 10 >/dev/null
   done
 
-  jq \
-    --arg chain_id "$CHAIN_ID" \
-    --arg funded "${TX_ADDRESS}=${TX_BALANCE}" \
-    --argjson validators "$validators_json" \
-    '
-      .chain_id = $chain_id
-      | .validators = $validators
-      | .app_state.balances = (.app_state.balances // [])
-      | if (.app_state.balances | index($funded)) then . else .app_state.balances += [$funded] end
-    ' \
-    "$base_genesis" > "$final_genesis"
+  log "adding test1 balance"
+  _gnogenesis balances add --genesis-path /work/genesis.json --single "${TX_ADDRESS}=${TX_BALANCE}" >/dev/null
 
+  local genesis_file="${SCENARIO_DIR}/genesis.json"
   for node in "${SCENARIO_NODES[@]}"; do
-    cp "$final_genesis" "${NODE_DATA_DIR[$node]}/genesis.json"
+    cp "$genesis_file" "${NODE_DATA_DIR[$node]}/genesis.json"
   done
 }
 
@@ -471,9 +526,8 @@ prepare_network() {
   mkdir -p "$SCENARIO_DIR"
 
   init_node_dirs
-  generate_base_genesis
   collect_node_ids
-  write_final_genesis
+  generate_genesis
   configure_nodes
   write_compose_file
   create_tx_key
@@ -611,7 +665,19 @@ docker_network_name() {
 }
 
 gnokey_tx_with_password() {
-  printf '%s\n' "$TX_PASSWORD" | docker run -i --rm --network "$(docker_network_name)" -v "${KEY_HOME}:/keys" "$GNOKEY_IMAGE" "$@"
+  # Consume leading -v <bind> docker volume flags before the gnokey subcommand.
+  local -a extra_docker_args=()
+  while [[ $# -gt 0 && "$1" == "-v" ]]; do
+    extra_docker_args+=("-v" "$2")
+    shift 2
+  done
+  printf '%s\n' "$TX_PASSWORD" | \
+    docker run -i --rm \
+      --network "$(docker_network_name)" \
+      -v "${KEY_HOME}:/keys" \
+      "${extra_docker_args[@]}" \
+      "$GNOKEY_IMAGE" \
+      "$@"
 }
 
 add_pkg() {
@@ -798,7 +864,6 @@ print_cluster_status() {
 }
 
 scenario_finish() {
-  docker rm -f "${PROJECT_NAME}-lazy-init" >/dev/null 2>&1 || true
   local sentry
   for sentry in "${SCENARIO_SENTRIES[@]+"${SCENARIO_SENTRIES[@]}"}"; do
     docker rm -f "${PROJECT_NAME}-${sentry}-bump-1" "${PROJECT_NAME}-${sentry}-bump-2" >/dev/null 2>&1 || true
