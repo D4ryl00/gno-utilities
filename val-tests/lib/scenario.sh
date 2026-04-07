@@ -660,6 +660,45 @@ wait_for_blocks() {
   wait_for_height "$node" "$((current + delta))" "$timeout"
 }
 
+# chain_advances succeeds if the chain produces at least <delta> new blocks on
+# <node> within <timeout> seconds. Use this when the caller needs to inspect the
+# result before deciding how to fail.
+chain_advances() {
+  local node="${1:?node required}"
+  local timeout="${2:-30}"
+  local delta="${3:-2}"
+  local before
+  before="$(node_height "$node")"
+  local target="$((before + delta))"
+  local i h
+  for i in $(seq 1 "$timeout"); do
+    h="$(node_height "$node" 2>/dev/null || printf '0')"
+    if [ "$h" -ge "$target" ] 2>/dev/null; then
+      log "chain advancing: ${node} reached h=${h} (was ${before})"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# assert_chain_advances fails if the chain does not produce at least <delta> new
+# blocks on <node> within <timeout> seconds. Use this to detect a chain halt.
+assert_chain_advances() {
+  local node="${1:?node required}"
+  local timeout="${2:-30}"
+  local delta="${3:-2}"
+
+  if chain_advances "$node" "$timeout" "$delta"; then
+    return 0
+  fi
+
+  local before
+  before="$(node_height "$node" 2>/dev/null || printf '0')"
+  local target="$((before + delta))"
+  die "chain halted: ${node} height stuck at h=${before} after ${timeout}s (expected >=${target})"
+}
+
 docker_network_name() {
   printf '%s' "$NETWORK_NAME"
 }
@@ -685,23 +724,50 @@ add_pkg() {
   local pkgdir="${2:?package dir required}"
   local pkgpath="${3:?package path required}"
   local gas_wanted="${4:-$TX_GAS_WANTED_ADD_PKG}"
+  local simulate_mode="${5:-}"
 
   local abs_pkgdir
   abs_pkgdir="$(cd "$pkgdir" && pwd)"
 
+  local -a cmd=(
+    maketx addpkg
+    --pkgdir /pkg
+    --pkgpath "$pkgpath"
+    --gas-fee "$TX_GAS_FEE"
+    --gas-wanted "$gas_wanted"
+    --broadcast=true
+    --chainid "$CHAIN_ID"
+    --remote "${NODE_SERVICE[$target_node]}:26657"
+    --home /keys
+    --insecure-password-stdin
+  )
+
+  if [ -n "$simulate_mode" ]; then
+    cmd+=(--simulate "$simulate_mode")
+  fi
+
+  cmd+=("$TX_KEY_NAME")
+
   gnokey_tx_with_password \
     -v "${abs_pkgdir}:/pkg:ro" \
-    maketx addpkg \
-      --pkgdir /pkg \
-      --pkgpath "$pkgpath" \
-      --gas-fee "$TX_GAS_FEE" \
-      --gas-wanted "$gas_wanted" \
-      --broadcast=true \
-      --chainid "$CHAIN_ID" \
-      --remote "${NODE_SERVICE[$target_node]}:26657" \
-      --home /keys \
-      --insecure-password-stdin \
-      "$TX_KEY_NAME"
+    "${cmd[@]}"
+}
+
+estimate_add_pkg_gas() {
+  local target_node="${1:?target node required}"
+  local pkgdir="${2:?package dir required}"
+  local pkgpath="${3:?package path required}"
+  local probe_gas_wanted="${4:-$TX_GAS_WANTED_ADD_PKG}"
+
+  local output
+  output="$(add_pkg "$target_node" "$pkgdir" "$pkgpath" "$probe_gas_wanted" only)"
+  printf '%s\n' "$output" >&2
+
+  local gas_used
+  gas_used="$(printf '%s\n' "$output" | awk '/GAS USED:/ {print $3; exit}')"
+  [ -n "$gas_used" ] || die "failed to parse simulated gas usage for addpkg on ${target_node}"
+
+  printf '%s\n' "$gas_used"
 }
 
 call_realm() {

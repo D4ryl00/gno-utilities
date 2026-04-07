@@ -10,11 +10,12 @@ PROJECT_02 = four-validators-restart-staggered
 PROJECT_03 = four-validators-restart-parallel
 PROJECT_04 = counter-realm-churn
 PROJECT_05 = sentry-ip-rotation
+PROJECT_06 = gas-nondeterminism-check
 
 .PHONY: build-gnoland-image build-gnokey-image build-gnogenesis-image build-images clone-gno \
-        scenario-01 scenario-02 scenario-03 scenario-04 scenario-05 \
-        logs-01 logs-02 logs-03 logs-04 logs-05 \
-        clean clean-01 clean-02 clean-03 clean-04 clean-05 \
+        scenario-01 scenario-02 scenario-03 scenario-04 scenario-05 scenario-06 \
+        logs-01 logs-02 logs-03 logs-04 logs-05 logs-06 \
+        clean clean-01 clean-02 clean-03 clean-04 clean-05 clean-06 \
         status
 
 clone-gno:
@@ -53,6 +54,9 @@ clean-04:
 clean-05:
 	rm -rf $(WORK_ROOT)/$(PROJECT_05)
 
+clean-06:
+	rm -rf $(WORK_ROOT)/$(PROJECT_06)
+
 scenario-01:
 	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) GNOGENESIS_IMAGE=$(GNOGENESIS_IMAGE) GNO_ROOT=$(GNO_ROOT) WORK_ROOT=$(WORK_ROOT) ./scenarios/01_five_validators_reset_four.sh
 
@@ -68,6 +72,9 @@ scenario-04:
 scenario-05:
 	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) GNOGENESIS_IMAGE=$(GNOGENESIS_IMAGE) GNO_ROOT=$(GNO_ROOT) WORK_ROOT=$(WORK_ROOT) ./scenarios/05_sentry_ip_rotation.sh
 
+scenario-06:
+	IMAGE_NAME=$(IMAGE) GNOKEY_IMAGE=$(GNOKEY_IMAGE) GNOGENESIS_IMAGE=$(GNOGENESIS_IMAGE) GNO_ROOT=$(GNO_ROOT) WORK_ROOT=$(WORK_ROOT) ./scenarios/06_gas_nondeterminism_check.sh
+
 logs-01:
 	docker compose -p $(PROJECT_01) logs -f $(NODE)
 
@@ -82,6 +89,9 @@ logs-04:
 
 logs-05:
 	docker compose -p $(PROJECT_05) logs -f $(NODE)
+
+logs-06:
+	docker compose -p $(PROJECT_06) logs -f $(NODE)
 
 status:
 	@while true; do \
