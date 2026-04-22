@@ -5,12 +5,12 @@ GNO_ROOT          ?= $(shell pwd)/gno
 WORK_ROOT         ?= /tmp/gno-val-tests
 NODE              ?=
 
-PROJECT_01 = five-validators-reset-four
-PROJECT_02 = four-validators-restart-staggered
-PROJECT_03 = four-validators-restart-parallel
-PROJECT_04 = counter-realm-churn
-PROJECT_05 = sentry-ip-rotation
-PROJECT_06 = gas-nondeterminism-check
+PROJECT_01 = scenario-01-five-validators-reset-four
+PROJECT_02 = scenario-02-four-validators-restart-staggered
+PROJECT_03 = scenario-03-four-validators-restart-parallel
+PROJECT_04 = scenario-04-counter-realm-churn
+PROJECT_05 = scenario-05-sentry-ip-rotation
+PROJECT_06 = scenario-06-gas-nondeterminism-check
 
 .PHONY: build-gnoland-image build-gnokey-image build-gnogenesis-image build-images clone-gno \
         scenario-01 scenario-02 scenario-03 scenario-04 scenario-05 scenario-06 \
@@ -108,4 +108,3 @@ status:
 		done; \
 		sleep 2; \
 	done
-
